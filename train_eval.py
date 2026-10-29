@@ -1,7 +1,9 @@
-"""Train ANFIS, an MLP, and a genetic algorithm on the same RDD2022 crop features.
+"""Train ANFIS, an MLP, a genetic algorithm, GA-ANFIS, and GA-ANN on the same crops.
 
-All three see the standardized geometry and CNN principal components built by
-features.py, and all three are scored on the same held-out crops.
+All five see the standardized geometry and CNN principal components built by
+features.py, and all five are scored on the same held-out crops. GA-ANFIS
+evolves the shared memberships and least squares sets the consequents. GA-ANN
+evolves a tanh hidden layer and least squares sets the class scores.
 """
 
 from __future__ import annotations
@@ -26,6 +28,10 @@ from sklearn.neural_network import MLPClassifier
 
 from anfis import AnfisClassifier, describe_rules, membership_labels
 from features import build_features, load_features, save_features
+from ga_anfis import GaAnfisClassifier
+from ga_anfis import save_result as save_ga_anfis
+from ga_ann import GaAnnClassifier, describe_network
+from ga_ann import save_result as save_ga_ann
 from genetic import GeneticClassifier, describe_weights
 
 PAPER_DETECTION_F1 = 0.770
@@ -71,7 +77,12 @@ def plot_confusion(labels: np.ndarray, predicted: np.ndarray, class_names: list[
     plt.close(figure)
 
 
-def plot_memberships(classifier: AnfisClassifier, feature_names: list[str], path: Path) -> None:
+def plot_memberships(
+    classifier: AnfisClassifier,
+    feature_names: list[str],
+    path: Path,
+    title: str = "ANFIS Gaussian membership functions (standardized inputs)",
+) -> None:
     classes = list(classifier.classes_)
     figure, axes = plt.subplots(
         len(classes),
@@ -98,18 +109,18 @@ def plot_memberships(classifier: AnfisClassifier, feature_names: list[str], path
                 axis.set_ylabel(f"{class_name}\nmembership")
             axis.set_ylim(0, 1.05)
             axis.legend(fontsize=7, frameon=False)
-    figure.suptitle("ANFIS Gaussian membership functions (standardized inputs)", y=1.01)
+    figure.suptitle(title, y=1.01)
     figure.tight_layout()
     figure.savefig(path, dpi=140, bbox_inches="tight")
     plt.close(figure)
 
 
-def plot_fitness(history: list[float], path: Path) -> None:
+def plot_fitness(history: list[float], path: Path, title: str = "Genetic algorithm fitness") -> None:
     figure, axis = plt.subplots(figsize=(6.4, 3.6))
     axis.plot(history, color="#1f4e79")
     axis.set_xlabel("Generation")
     axis.set_ylabel("Best training macro F1")
-    axis.set_title("Genetic algorithm fitness")
+    axis.set_title(title)
     axis.set_ylim(0, 1)
     figure.tight_layout()
     figure.savefig(path, dpi=140)
@@ -117,21 +128,20 @@ def plot_fitness(history: list[float], path: Path) -> None:
 
 
 def plot_model_comparison(report: dict, class_names: list[str], path: Path) -> None:
-    models = ["anfis", "mlp", "genetic_algorithm"]
-    labels = ["ANFIS", "MLP", "Genetic algorithm"]
-    figure, axis = plt.subplots(figsize=(7.2, 4.2))
+    models = ["ga_ann", "ga_anfis", "genetic_algorithm", "mlp", "anfis"]
+    labels = ["GA-ANN", "GA-ANFIS", "Genetic algorithm", "MLP", "ANFIS"]
+    figure, axis = plt.subplots(figsize=(9.2, 4.6))
     x = np.arange(len(class_names) + 1)
-    width = 0.24
-    metric_names = ["macro_f1", *class_names]
+    width = 0.15
     for offset, (model, label) in enumerate(zip(models, labels)):
         values = [report[model]["macro_f1"]] + [report[model]["per_class_f1"][name] for name in class_names]
-        axis.bar(x + (offset - 1) * width, values, width, label=label)
+        axis.bar(x + (offset - 2) * width, values, width, label=label)
     axis.axhline(PAPER_DETECTION_F1, color="#666666", linestyle="--", linewidth=1, label="Paper detection F1 0.770")
     axis.set_xticks(x, ["Macro F1", *class_names])
     axis.set_ylim(0, 1)
     axis.set_ylabel("F1")
     axis.set_title("Crop classification F1. The dashed line is a different task.")
-    axis.legend(frameon=False, fontsize=8)
+    axis.legend(frameon=False, fontsize=7, ncol=2)
     figure.tight_layout()
     figure.savefig(path, dpi=140)
     plt.close(figure)
@@ -140,6 +150,8 @@ def plot_model_comparison(report: dict, class_names: list[str], path: Path) -> N
 def _ranking_sentence(report: dict) -> str:
     ranking = sorted(
         (
+            ("GA-ANN", report["ga_ann"]["macro_f1"]),
+            ("GA-ANFIS", report["ga_anfis"]["macro_f1"]),
             ("ANFIS", report["anfis"]["macro_f1"]),
             ("the MLP", report["mlp"]["macro_f1"]),
             ("the genetic algorithm", report["genetic_algorithm"]["macro_f1"]),
@@ -147,11 +159,12 @@ def _ranking_sentence(report: dict) -> str:
         key=lambda item: item[1],
         reverse=True,
     )
-    first, second, third = ranking
+    names = ", ".join(f"{name} ({score:.3f})" for name, score in ranking)
     return (
-        f"On the shared crop test, {first[0]} has the highest macro F1 ({first[1]:.3f}), "
-        f"then {second[0]} ({second[1]:.3f}), then {third[0]} ({third[1]:.3f}). "
-        "ANFIS also writes fuzzy rules. The genetic algorithm writes one linear weight per input."
+        f"On the shared crop test, macro F1 ranks {names}. "
+        "GA-ANN evolves a tanh hidden layer and writes one weight per hidden unit. "
+        "GA-ANFIS evolves the shared memberships and writes fuzzy rules. "
+        "The linear genetic algorithm writes one weight per input."
     )
 
 
@@ -168,7 +181,13 @@ def write_comparison(report: dict, path: Path) -> None:
         "",
         "Test scores",
     ]
-    for key, label in (("anfis", "ANFIS"), ("mlp", "MLP"), ("genetic_algorithm", "Genetic algorithm")):
+    for key, label in (
+        ("ga_ann", "GA-ANN"),
+        ("ga_anfis", "GA-ANFIS"),
+        ("anfis", "ANFIS"),
+        ("mlp", "MLP"),
+        ("genetic_algorithm", "Genetic algorithm"),
+    ):
         block = report[key]
         per_class = ", ".join(f"{name} {value:.3f}" for name, value in block["per_class_f1"].items())
         lines.append(
@@ -180,16 +199,16 @@ def write_comparison(report: dict, path: Path) -> None:
             "What the paper measured",
             PAPER_REFERENCE,
             "Rank 2 was YOLO with image tiling (F1 0.743). Rank 3 was YOLOv7 (F1 0.741).",
-            "The paper does not train ANFIS, an MLP on crops, or a genetic algorithm.",
+            "The paper does not train ANFIS, an MLP on crops, a genetic algorithm, GA-ANFIS, or GA-ANN.",
             "",
             "Why the higher crop scores do not beat the paper",
             "A crop classifier only names a box that a human already drew. The paper's F1 also requires the model to place that box in a full road image, across six countries and four damage types.",
             "A crop accuracy around 0.81 to 0.83 next to the paper's detection F1 of 0.770 makes the crop models look better. They are solving an easier problem on a smaller subset.",
             "",
             "How to say this in the ATT",
-            "RDD2022 is a detection dataset built for deep convolutional networks. This study adds three soft-computing classifiers on Czech damage crops: a neural network (MLP), a neuro-fuzzy model (ANFIS), and an evolutionary model (genetic algorithm).",
+            "RDD2022 is a detection dataset built for deep convolutional networks. This study adds five classifiers on Czech damage crops: a neural network (MLP), standalone ANFIS, a linear genetic algorithm, a GA-ANN hybrid, and a GA-ANFIS hybrid.",
             _ranking_sentence(report),
-            "None of the three replaces the paper's detector. They show what fuzzy rules and evolutionary search can explain once a damage region has already been located.",
+            "None of the five replaces the paper's detector. GA-ANN searches the hidden layer. GA-ANFIS searches the memberships and states fuzzy rules.",
             "",
         ]
     )
@@ -202,8 +221,9 @@ def write_rules(
     features: np.ndarray,
     labels: np.ndarray,
     path: Path,
+    intro: list[str] | None = None,
 ) -> None:
-    lines = [
+    lines = intro or [
         "Learned ANFIS rules, ranked by mean firing strength on training crops of that class.",
         "Low and High refer to the standardized training distribution of each input.",
         "score is the first-order Takagi-Sugeno output of that one-vs-rest model.",
@@ -233,6 +253,11 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--n-mfs", type=int, default=2)
+    parser.add_argument("--population", type=int, default=40, help="GA-ANFIS population size")
+    parser.add_argument("--generations", type=int, default=40, help="GA-ANFIS generations")
+    parser.add_argument("--hidden", type=int, default=8, help="GA-ANN hidden units")
+    parser.add_argument("--ann-population", type=int, default=80, help="GA-ANN population size")
+    parser.add_argument("--ann-generations", type=int, default=80, help="GA-ANN generations")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -273,9 +298,29 @@ def main() -> None:
     genetic.fit(x_train, y_train)
     genetic_pred = genetic.predict(x_test)
 
+    ga_anfis = GaAnfisClassifier(
+        n_mfs=args.n_mfs,
+        population=args.population,
+        generations=args.generations,
+        seed=args.seed,
+    )
+    ga_anfis.fit(x_train, y_train)
+    ga_anfis_pred = ga_anfis.predict(x_test)
+
+    ga_ann = GaAnnClassifier(
+        hidden=args.hidden,
+        population=args.ann_population,
+        generations=args.ann_generations,
+        seed=args.seed,
+    )
+    ga_ann.fit(x_train, y_train)
+    ga_ann_pred = ga_ann.predict(x_test)
+
     anfis_scores = scores(y_test, anfis_pred, class_names)
     mlp_scores = scores(y_test, mlp_pred, class_names)
     genetic_scores = scores(y_test, genetic_pred, class_names)
+    ga_anfis_scores = scores(y_test, ga_anfis_pred, class_names)
+    ga_ann_scores = scores(y_test, ga_ann_pred, class_names)
     report = {
         "dataset": "RDD2022 Czech Republic training images",
         "task": "classification of annotated damage crops",
@@ -289,6 +334,8 @@ def main() -> None:
         "anfis": anfis_scores,
         "mlp": mlp_scores,
         "genetic_algorithm": genetic_scores,
+        "ga_anfis": ga_anfis_scores,
+        "ga_ann": ga_ann_scores,
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -298,7 +345,17 @@ def main() -> None:
         + "\nMLP\n"
         + classification_report(y_test, mlp_pred, labels=class_names, zero_division=0)
         + "\nGenetic algorithm\n"
-        + classification_report(y_test, genetic_pred, labels=class_names, zero_division=0),
+        + classification_report(y_test, genetic_pred, labels=class_names, zero_division=0)
+        + "\nGA-ANFIS\n"
+        + classification_report(y_test, ga_anfis_pred, labels=class_names, zero_division=0)
+        + "\nGA-ANN\n"
+        + classification_report(y_test, ga_ann_pred, labels=class_names, zero_division=0),
+        encoding="utf-8",
+    )
+    save_ga_anfis(ga_anfis.result_, args.out_dir / "ga_anfis.npz")
+    save_ga_ann(ga_ann.result_, args.out_dir / "ga_ann.npz")
+    (args.out_dir / "ga_ann_network.txt").write_text(
+        "\n".join(describe_network(ga_ann.result_, feature_names)) + "\n",
         encoding="utf-8",
     )
     (args.out_dir / "ga_weights.txt").write_text(
@@ -327,11 +384,60 @@ def main() -> None:
         args.out_dir / "confusion_ga.png",
         "Genetic algorithm confusion matrix",
     )
+    plot_confusion(
+        y_test,
+        ga_anfis_pred,
+        class_names,
+        args.out_dir / "confusion_ga_anfis.png",
+        "GA-ANFIS confusion matrix",
+    )
+    plot_confusion(
+        y_test,
+        ga_ann_pred,
+        class_names,
+        args.out_dir / "confusion_ga_ann.png",
+        "GA-ANN confusion matrix",
+    )
     plot_memberships(anfis, feature_names, args.out_dir / "membership_functions.png")
+    plot_memberships(
+        ga_anfis,
+        feature_names,
+        args.out_dir / "ga_anfis_memberships.png",
+        title="GA-ANFIS shared Gaussian memberships (standardized inputs)",
+    )
     plot_fitness(genetic.result_.history_, args.out_dir / "ga_fitness.png")
+    plot_fitness(
+        ga_anfis.result_.history_,
+        args.out_dir / "ga_anfis_fitness.png",
+        title="GA-ANFIS fitness",
+    )
+    plot_fitness(
+        ga_ann.result_.history_,
+        args.out_dir / "ga_ann_fitness.png",
+        title="GA-ANN fitness",
+    )
     plot_model_comparison(report, class_names, args.out_dir / "comparison_f1.png")
     write_rules(anfis, feature_names, x_train, y_train, args.out_dir / "rules.txt")
-    print(json.dumps({"anfis": anfis_scores, "mlp": mlp_scores, "genetic_algorithm": genetic_scores}, indent=2))
+    write_rules(
+        ga_anfis,
+        feature_names,
+        x_train,
+        y_train,
+        args.out_dir / "ga_anfis_rules.txt",
+        intro=[
+            "GA-ANFIS rules. Memberships are shared and were chosen by the genetic algorithm.",
+            "Consequents are ridge least squares.",
+            "Low and High refer to the standardized training distribution of each input.",
+            "",
+        ],
+    )
+    print(json.dumps({
+        "anfis": anfis_scores,
+        "mlp": mlp_scores,
+        "genetic_algorithm": genetic_scores,
+        "ga_anfis": ga_anfis_scores,
+        "ga_ann": ga_ann_scores,
+    }, indent=2))
 
 
 if __name__ == "__main__":
